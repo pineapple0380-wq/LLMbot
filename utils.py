@@ -70,49 +70,15 @@ def load_weights(target_module, state_dict, module_name="Module"):
         print(f"  ❌ [{module_name}] Failed to match any keys. Target keys example: {list(target_keys)[:3]}")
         return False
 
-class AvUCLoss(nn.Module):
-    """
-    [Rigorous] Accuracy vs Uncertainty Calibration Loss
-    来源于论文: "Accuracy versus Uncertainty Calibration in Deep Learning"
-    作用: 这是一个可微的排序损失，它不强制 S 的绝对值，
-         而是强制: P(correct | confident) > P(correct | uncertain)
-    """
-    def __init__(self, beta=1.0):
-        super().__init__()
-        self.beta = beta
 
-    def forward(self, logits, labels, uncertainty):
-        """
-        logits: [Batch, Num_Classes]
-        labels: [Batch]
-        uncertainty: [Batch] (EDL计算出的 u)
-        """
-        probs = F.softmax(logits, dim=1)
-        # 获取模型对真实类别的预测概率
-        true_probs = torch.gather(probs, 1, labels.unsqueeze(1)).squeeze(1)
-        
-        # 定义两个组的 Log 概率
-        # 1. 精确且自信 (Accurate & Certain) -> 我们希望这部分多
-        # 2. 错误且不确定 (Inaccurate & Uncertain) -> 我们希望这部分多
-        
-        # 这里的 confidence 定义为 (1 - uncertainty)
-        confidence = 1.0 - uncertainty
-        
-        # 理想状态指示器 (Indicator)
-        # 这是一个软化的 Indicator，避免使用硬性的 int(correct)
-        # 使得梯度可以传播
-        pred_acc = true_probs # 越高越好
-        
-        # AvU Loss 定义:
-        # 我们希望 maximize: (Acc * Conf) + ((1-Acc) * (1-Conf))
-        # 等价于 minimize: - log( ... )
-        
-        avu = (pred_acc * confidence) + ((1 - pred_acc) * (1 - confidence))
-        
-        # 使用 Log 形式增强数值稳定性
-        loss_avuc = -torch.log(avu + 1e-10).mean()
-        
-        return loss_avuc
+
+def jsd_probs(p, q, eps=1e-9):
+    p = p.clamp(min=eps)
+    q = q.clamp(min=eps)
+    m = 0.5 * (p + q)
+    kl_pm = F.kl_div(m.log(), p, reduction="none").sum(dim=1, keepdim=True)
+    kl_qm = F.kl_div(m.log(), q, reduction="none").sum(dim=1, keepdim=True)
+    return 0.5 * (kl_pm + kl_qm)
 
 def kl_divergence_dirichlet(alpha, num_classes=2):
     ones = torch.ones([1, num_classes], dtype=torch.float32, device=alpha.device)
