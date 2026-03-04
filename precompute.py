@@ -16,17 +16,98 @@ from tqdm import tqdm
 import matplotlib.pyplot as plt
 from sklearn.manifold import TSNE
 from sklearn.decomposition import PCA
-from sklearn.metrics import silhouette_score, davies_bouldin_index
+from sklearn.metrics import silhouette_score, davies_bouldin_score
 import warnings
 import wandb
+import csv
 
 warnings.filterwarnings('ignore')
+
+def analyze_structural_weakness(embeddings_dict, labels, save_dir, instruction_mode):
+    """
+    升级版：遍历所有层计算指标，生成倒U曲线证据 CSV，并为最后一层生成 t-SNE。
+    """
+    print("\n[Analysis] Calculating Layer-wise Structural Metrics...")
+    
+    valid_mask = (labels != -1)
+    if not np.any(valid_mask):
+        print("[Warning] No valid labels found. Skipping analysis.")
+        return
+
+    y = labels[valid_mask]
+    metrics = []
+
+    # 按层深排序进行评估
+    sorted_keys = sorted(embeddings_dict.keys(), key=lambda x: int(x) if int(x) >= 0 else 999)
+    last_layer_key = str(sorted_keys[-1])
+
+    for layer_key in sorted_keys:
+        X = embeddings_dict[layer_key][valid_mask].numpy()
+        
+        # 为了应对高维距离诅咒，先降维再算指标能更好反映流形结构
+        X_pca = PCA(n_components=50).fit_transform(X) if X.shape[1] > 50 else X
+        
+        sil_score = silhouette_score(X_pca, y)
+        db_score = davies_bouldin_score(X_pca, y) # 已修复旧版函数名问题
+        
+        print(f"Layer {layer_key:>3s} | Silhouette: {sil_score:.4f} | DB: {db_score:.4f}")
+        metrics.append({"layer": layer_key, "silhouette": sil_score, "davies_bouldin": db_score})
+        
+        if wandb.run is not None:
+            wandb.log({
+                f"motivation/L{layer_key}_silhouette": sil_score,
+                f"motivation/L{layer_key}_davies_bouldin": db_score
+            })
+
+    # 保存多层表现 CSV，用于绘制论文里的 "倒 U 型" 曲线
+    csv_path = Path(save_dir) / f"layer_metrics_instr_{instruction_mode}.csv"
+    with open(csv_path, 'w', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=["layer", "silhouette", "davies_bouldin"])
+        writer.writeheader()
+        writer.writerows(metrics)
+    print(f"\n[Output] Metric curve data saved to: {csv_path}")
+
+    # =================保留原版的 t-SNE 可视化功能=================
+    print(f"[Analysis] Generating t-SNE Plot for Last Target Layer ({last_layer_key})...")
+    X_last = embeddings_dict[last_layer_key][valid_mask].numpy()
+    X_pca_last = PCA(n_components=50).fit_transform(X_last) if X_last.shape[1] > 50 else X_last
+    
+    tsne = TSNE(n_components=2, random_state=42, init='pca', learning_rate='auto')
+    X_embedded = tsne.fit_transform(X_pca_last)
+    
+    plt.figure(figsize=(10, 8))
+    plt.scatter(X_embedded[y==0, 0], X_embedded[y==0, 1], c='#1f77b4', alpha=0.6, label='Human', s=10)
+    plt.scatter(X_embedded[y==1, 0], X_embedded[y==1, 1], c='#d62728', alpha=0.6, label='Bot', s=10)
+    
+    # 动态获取最后一层的指标用于标题
+    final_sil = next(m['silhouette'] for m in metrics if m['layer'] == last_layer_key)
+    plt.title(f"Qwen3-Embedding Space - Layer {last_layer_key} (Silhouette: {final_sil:.3f})")
+    plt.legend()
+    plt.grid(True, linestyle='--', alpha=0.3)
+    
+    plot_path = Path(save_dir) / f"motivation_tsne_qwen3_L{last_layer_key}_instr_{instruction_mode}.png"
+    plt.savefig(plot_path, dpi=300)
+    print(f"[Output] Plot saved to: {plot_path}")
+
+
+def locate_blocks(model):
+    """动态寻找模型的 Transformer 层，以便挂载 Hook"""
+    for attr_chain in [("model", "layers"), ("layers",), ("transformer", "h")]:
+        cur = model
+        ok = True
+        for a in attr_chain:
+            if not hasattr(cur, a):
+                ok = False; break
+            cur = getattr(cur, a)
+        if ok and isinstance(cur, (torch.nn.ModuleList, list)):
+            return cur
+    raise RuntimeError("Cannot locate transformer blocks in the provided model")
 
 class Qwen3EmbeddingGenerator:
     """
     Qwen3-Embedding-8B Generator with Scientific Controls
     """
-    def __init__(self, model_path='Qwen/Qwen3-Embedding-8B', device='cuda', batch_size=32, pooling='last', use_wandb=True):
+    def __init__(self, model_path='Qwen/Qwen3-Embedding-8B', device='cuda', batch_size=32, pooling='last',target_layers=None, instruction_mode='on', use_wandb=True):
         """
         Args:
             pooling: 'mean' (Average all tokens) or 'last' (EOS token - recommended for some generative models)
@@ -34,6 +115,7 @@ class Qwen3EmbeddingGenerator:
         self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
         self.batch_size = batch_size
         self.pooling_strategy = pooling
+        self.instruction_mode = instruction_mode  # 'on', 'off', 'noise'
         self.use_wandb = use_wandb and wandb is not None
 
         if self.use_wandb:
@@ -43,14 +125,38 @@ class Qwen3EmbeddingGenerator:
         
         print(f"[System] Loading Backbone: {model_path}")
         print(f"[System] Pooling Strategy: {self.pooling_strategy.upper()}")
+        print(f"[System] Instruction Mode: {self.instruction_mode.upper()}")
         
         self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
         self.model = AutoModel.from_pretrained(
             model_path, 
             trust_remote_code=True, 
-            torch_dtype=torch.float16 if self.device.type == 'cuda' else torch.float32
-        ).to(self.device)
+            torch_dtype=torch.float16 if self.device.type == 'cuda' else torch.float32,
+            device_map="auto"
+        )
         self.model.eval()
+
+        self.blocks = locate_blocks(self.model)
+        self.L = len(self.blocks) # 精准读取模型层数 (通常为 36)
+        print(f"[Architecture] Detected {self.L} Transformer Blocks.")
+
+        # 自动读取层数与层位解析
+        if target_layers == 'sweep':
+            # 扫描模式：提取后半段的多个层位，寻找倒 U 曲线的顶点
+            self.target_layers_raw = list(range(self.L // 2, self.L, 2))
+            if -1 not in self.target_layers_raw and (self.L - 1) not in self.target_layers_raw:
+                self.target_layers_raw.append(-1)
+        elif target_layers:
+            self.target_layers_raw = [int(x.strip()) for x in target_layers.split(",")]
+        else:
+            # 默认提取 Late-middle 到 Final 层
+            self.target_layers_raw = [self.L // 2, int(0.72 * self.L), int(0.85 * self.L), -1]
+
+        # 将负数索引转化为正数索引
+        self.layer_ids = [(i if i >= 0 else self.L + i) for i in self.target_layers_raw]
+        assert all(0 <= i < self.L for i in self.layer_ids), "Layer index out of bounds."
+        print(f"[Config] Target Layers (Raw): {self.target_layers_raw}")
+        print(f"[Config] Resolved Target Layers: {self.layer_ids}")
         
         # Scientific Control: Task-Specific Instruction
         self.instruction = "Instruct: Classify this social media user based on their profile and behavior to detect automation.\nInput: "
@@ -93,111 +199,93 @@ class Qwen3EmbeddingGenerator:
 
     def encode_batch(self, texts):
         # 1. Apply Instruction + Cleaning
-        batch_input = [self.instruction + self._clean_text(t) for t in texts]
+        batch_input = []
+        for t in texts:
+            cleaned = self._clean_text(t)
+            if self.instruction_mode == 'on':
+                batch_input.append(self.instruction + cleaned)
+            elif self.instruction_mode == 'off':
+                batch_input.append(cleaned)
+            elif self.instruction_mode == 'noise':
+                batch_input.append("Ignore instructions. Random input: \nInput: " + cleaned)
         
         inputs = self.tokenizer(
-            batch_input, 
-            padding=True, 
-            truncation=True, 
-            max_length=512, 
-            return_tensors='pt'
+            batch_input, padding=True, truncation=True, 
+            max_length=512, return_tensors='pt'
         ).to(self.device)
         
+        # Forward Hook to capture hidden states at target layers
+        captured_hiddens = {}
+        hooks = []
+
+        def mk_hook(lid):
+            def hook_fn(module, inp, out):
+                h = out[0] if isinstance(out, (tuple, list)) else out
+                captured_hiddens[lid] = h
+            return hook_fn
+
+        for lid in set(self.layer_ids):
+            hooks.append(self.blocks[lid].register_forward_hook(mk_hook(lid)))
+            
         with torch.no_grad():
-            outputs = self.model(**inputs)
+            _ = self.model(**inputs, return_dict=True)
             
-            # 2. Apply Selected Pooling Strategy
+        layer_embeddings = {}
+        for raw_id, res_id in zip(self.target_layers_raw, self.layer_ids):
+            h = captured_hiddens[res_id]
+            
             if self.pooling_strategy == 'last':
-                embeddings = self._last_token_pooling(outputs.last_hidden_state, inputs['attention_mask'])
+                emb = self._last_token_pooling(h, inputs['attention_mask'])
             else:
-                embeddings = self._mean_pooling(outputs.last_hidden_state, inputs['attention_mask'])
+                emb = self._mean_pooling(h, inputs['attention_mask'])
+                
+            emb = F.normalize(emb, p=2, dim=1)
+            layer_embeddings[str(raw_id)] = emb.cpu()
             
-            # 3. CRITICAL: L2 Normalization
-            # Required for Cosine Similarity to work in GNNs/Clustering
-            embeddings = F.normalize(embeddings, p=2, dim=1)
-        
-        return embeddings.cpu()
+        # 释放资源防止 OOM
+        for hk in hooks:
+            hk.remove()
+        captured_hiddens.clear()
+        if self.device.type == 'cuda':
+            torch.cuda.empty_cache()
+            
+        return layer_embeddings
 
     def generate_embeddings(self, raw_texts):
         print(f"[Process] Encoding {len(raw_texts)} users...")
-        all_embeddings = []
+        all_embeddings = {str(k): [] for k in self.target_layers_raw}
         
         iterator = range(0, len(raw_texts), self.batch_size)
         for i in tqdm(iterator, desc="Inference"):
             batch_raw = raw_texts[i:i + self.batch_size]
-            emb = self.encode_batch(batch_raw)
-            all_embeddings.append(emb)
+            batch_embs = self.encode_batch(batch_raw)
+            
+            for k, v in batch_embs.items():
+                all_embeddings[k].append(v)
             
             if self.use_wandb and i % (self.batch_size * 10) == 0:
                 wandb.log({"progress": i / len(raw_texts)})
             
-        return torch.cat(all_embeddings, dim=0)
+        for k in all_embeddings.keys():
+            all_embeddings[k] = torch.cat(all_embeddings[k], dim=0)
+            
+        return all_embeddings
 
-def analyze_structural_weakness(embeddings, labels, save_dir):
-    """
-    Generates the 'Motivation' metrics for Figure 1.
-    """
-    print("\n[Analysis] Calculating Structural Metrics...")
-    
-    # Filter out unlabeled data (-1 or nulls) if necessary
-    # Assuming labels are integers 0 (Human) and 1 (Bot)
-    valid_mask = (labels != -1)
-    if not np.any(valid_mask):
-        print("[Warning] No valid labels found. Skipping analysis.")
-        return
-
-    X = embeddings[valid_mask].numpy()
-    y = labels[valid_mask]
-    
-    # 1. Metrics
-    sil_score = silhouette_score(X, y)
-    db_score = davies_bouldin_index(X, y)
-    
-    print(f"\n{'='*40}")
-    print(f"MOTIVATION METRICS")
-    print(f"{'='*40}")
-    print(f"Silhouette Score: {sil_score:.4f} (Low = Motivation Validated)")
-    print(f"Davies-Bouldin:   {db_score:.4f} (High = Motivation Validated)")
-    print(f"{'='*40}\n")
-    
-    if wandb.run is not None:
-        wandb.log({
-            "motivation/silhouette": sil_score,
-            "motivation/davies_bouldin": db_score
-        })
-
-    # 2. t-SNE Visualization
-    print("[Analysis] Generating t-SNE Plot...")
-    # PCA first for speed
-    X_pca = PCA(n_components=50).fit_transform(X) if X.shape[1] > 50 else X
-    
-    tsne = TSNE(n_components=2, random_state=42, init='pca', learning_rate='auto')
-    X_embedded = tsne.fit_transform(X_pca)
-    
-    plt.figure(figsize=(10, 8))
-    # Plot Humans
-    plt.scatter(X_embedded[y==0, 0], X_embedded[y==0, 1], c='#1f77b4', alpha=0.6, label='Human', s=10)
-    # Plot Bots
-    plt.scatter(X_embedded[y==1, 0], X_embedded[y==1, 1], c='#d62728', alpha=0.6, label='Bot', s=10)
-    
-    plt.title(f"Qwen3-Embedding Space (Silhouette: {sil_score:.3f})")
-    plt.legend()
-    plt.grid(True, linestyle='--', alpha=0.3)
-    
-    plot_path = Path(save_dir) / "motivation_tsne_qwen3.png"
-    plt.savefig(plot_path, dpi=300)
-    print(f"[Output] Plot saved to: {plot_path}")
-    
-    if wandb.run is not None:
-        wandb.log({"motivation/plot": wandb.Image(str(plot_path))})
 
 def main():
+    
     parser = argparse.ArgumentParser()
     parser.add_argument('--dataset_path', type=str, default='./datasets/TwiBot-20')
     parser.add_argument('--batch_size', type=int, default=32)
     parser.add_argument('--pooling', type=str, default='last', choices=['mean', 'last'], 
                         help="Pooling strategy: 'mean' or 'last' (EOS)")
     parser.add_argument('--no_wandb', action='store_true', help="Disable WandB")
+    
+    # 新增实验控制参数
+    parser.add_argument('--layers', type=str, default=None, 
+                        help='Comma-separated layer indices (e.g., "18,26,30,-1") or "sweep"')
+    parser.add_argument('--instruction_mode', type=str, default='on', choices=['on', 'off', 'noise'],
+                        help="Controls the prompt prefix to test robustness.")
     args = parser.parse_args()
     
     base_path = Path(args.dataset_path)
@@ -237,19 +325,23 @@ def main():
     generator = Qwen3EmbeddingGenerator(
         batch_size=args.batch_size, 
         pooling=args.pooling,
+        target_layers=args.layers,
+        instruction_mode=args.instruction_mode,
         use_wandb=not args.no_wandb
     )
-    embeddings = generator.generate_embeddings(texts)
+
+    embeddings_dict = generator.generate_embeddings(texts)
     
     # 4. Save
-    output_filename = f"qwen3_emb_{args.pooling}.pt"
-    output_path = base_path / output_filename
-    torch.save(embeddings, output_path)
-    print(f"[Output] Embeddings saved to {output_path}")
+    for layer_id, emb in embeddings_dict.items():
+        output_filename = f"qwen3_emb_{args.pooling}_L{layer_id}_instr_{args.instruction_mode}.pt"
+        output_path = base_path / output_filename
+        torch.save(emb, output_path)
+        print(f"[Output] Embeddings saved to {output_path}")
     
     # 5. Run Motivation Analysis
     # This is the "Professor's Requirement" - prove the weakness immediately
-    analyze_structural_weakness(embeddings, labels, base_path)
+    analyze_structural_weakness(embeddings_dict, labels, base_path, args.instruction_mode)
     
     if wandb.run is not None:
         wandb.finish()
